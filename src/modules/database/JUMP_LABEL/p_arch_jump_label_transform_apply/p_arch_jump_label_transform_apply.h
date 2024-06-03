@@ -36,15 +36,53 @@
 #ifndef P_LKRG_CI_ARCH_JUMP_LABEL_TRANSFORM_APPLY_H
 #define P_LKRG_CI_ARCH_JUMP_LABEL_TRANSFORM_APPLY_H
 
+#include <asm/linkage.h> /* for ASM_RET */
+
+#if defined(RHEL_RELEASE_CODE) && defined(DISP32_SIZE)
+ #define P_LKRG_KERNEL_RHEL_VAR_LEN_JUMP_LABEL 1
+#endif
+
+/*
+ * This can be extended to other LTS or active branches if and when they
+ * receive the variable length JUMP_LABEL feature backport, although the
+ * addition of ASM_RET is part of the same change set and thus our check
+ * for it hopefully makes the specific kernel version checks redundant.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0) || \
+    (LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 40)) || \
+    (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 133)) || \
+    defined(ASM_RET)
+ #define P_LKRG_KERNEL_HAS_VAR_LEN_JUMP_LABEL 1
+#else
+ #define P_LKRG_KERNEL_HAS_VAR_LEN_JUMP_LABEL 0
+#endif
+
 #include <asm/text-patching.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) || \
+    defined(P_LKRG_KERNEL_RHEL_VAR_LEN_JUMP_LABEL)
+ #if !P_LKRG_KERNEL_HAS_VAR_LEN_JUMP_LABEL || \
+     (defined(P_LKRG_KERNEL_RHEL_VAR_LEN_JUMP_LABEL) && \
+      (RHEL_RELEASE_CODE == RHEL_RELEASE_VERSION(9,0) || \
+      RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(8,8)))
 typedef struct _p_text_poke_loc {
     s32 rel_addr; /* addr := _stext + rel_addr */
     s32 rel32;
     u8 opcode;
     const u8 text[POKE_MAX_OPCODE_SIZE];
 } p_text_poke_loc;
+ #else
+typedef struct _p_text_poke_loc {
+    /* addr := _stext + rel_addr */
+    s32 rel_addr;
+    s32 disp;
+    u8 len;
+    u8 opcode;
+    const u8 text[POKE_MAX_OPCODE_SIZE];
+    /* see text_poke_bp_batch() */
+    u8 old;
+} p_text_poke_loc;
+ #endif
 #else
 typedef struct text_poke_loc p_text_poke_loc;
 #endif

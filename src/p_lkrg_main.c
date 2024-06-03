@@ -16,6 +16,7 @@
  */
 
 #include "p_lkrg_main.h"
+#include "modules/net/net.h"
 
 unsigned int log_level = 3;
 unsigned int heartbeat = 0;
@@ -24,7 +25,7 @@ unsigned int interval = 15;
 unsigned int kint_validate = 3;
 unsigned int kint_enforce = 2;
 unsigned int msr_validate = 0;
-unsigned int pint_validate = 2;
+unsigned int pint_validate = 1;
 unsigned int pint_enforce = 1;
 unsigned int pcfi_validate = 2;
 unsigned int pcfi_enforce = 1;
@@ -43,18 +44,20 @@ unsigned int profile_enforce = 2;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 static enum cpuhp_state p_hot_cpus;
 #endif
-unsigned int p_attr_init = 0x0;
+unsigned int p_attr_init = 0;
+
+DEFINE_MUTEX(p_ro_page_mutex);
 
 p_ro_page p_ro __p_lkrg_read_only = {
 
-#if !defined(CONFIG_ARM)
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
    .p_marker_np1 = P_LKRG_MARKER1,
 #endif
 
    .p_lkrg_global_ctrl.ctrl = {
       .p_kint_validate = 3,               // kint_validate
       .p_kint_enforce = 2,                // kint_enforce
-      .p_pint_validate = 2,               // pint_validate
+      .p_pint_validate = 1,               // pint_validate
       .p_pint_enforce = 1,                // pint_enforce
       .p_interval = 15,                   // interval
       .p_log_level = 3,                   // log_level
@@ -78,7 +81,7 @@ p_ro_page p_ro __p_lkrg_read_only = {
       .p_profile_enforce = 2              // profile_enforce
    },
 
-#if !defined(CONFIG_ARM)
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
    .p_marker_np2 = P_LKRG_MARKER1,
    .p_marker_np3 = P_LKRG_MARKER2
 #endif
@@ -86,35 +89,47 @@ p_ro_page p_ro __p_lkrg_read_only = {
 };
 
 
-void p_init_page_attr(void) {
+static char *p_verify_boot_params(void) {
 
-   unsigned long *p_long_tmp = 0x0;
-#if !defined(CONFIG_ARM)
+   char **p_params_ptr = (char **)P_SYM(p_kallsyms_lookup_name)("saved_command_line");
+   char *p_params;
+
+   p_params = (p_params_ptr) ? *p_params_ptr : NULL;
+
+   if (!p_params) {
+      p_print_log(P_LOG_FAULT, "Can't find kernel boot parameters, not checking for '" P_BOOT_DISABLE_LKRG "'");
+      return NULL;
+   }
+
+   return strstr(p_params, P_BOOT_DISABLE_LKRG);
+}
+
+static void p_init_page_attr(void) {
+
+   unsigned long *p_long_tmp = 0;
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
    unsigned long p_long_offset = PAGE_SIZE/sizeof(p_long_tmp); // On purpose sizeof pointer
 #endif
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_init_page_attr>\n");
-
    p_long_tmp = (unsigned long *)P_CTRL_ADDR;
 
-#if !defined(CONFIG_ARM)
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
    if (*(p_long_tmp-p_long_offset) == P_LKRG_MARKER1) {
-      p_print_log(P_LKRG_INFO, "Found marker before configuration page.\n");
+      p_debug_log(P_LOG_DEBUG, "Found marker before configuration page");
       if (*(p_long_tmp+p_long_offset) == P_LKRG_MARKER1) {
-         p_print_log(P_LKRG_INFO, "Found marker after configuration page.\n");
+         p_debug_log(P_LOG_DEBUG, "Found marker after configuration page");
 #endif
+         P_SYM(p_state_init) = 2;
          p_set_memory_ro((unsigned long)p_long_tmp,1);
-         p_print_log(P_LKRG_INFO, "Configuration page marked read-only.\n");
+         p_debug_log(P_LOG_DEBUG, "Configuration page marked read-only");
          p_attr_init++;
-#if !defined(CONFIG_ARM)
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
          p_set_memory_np((unsigned long)(p_long_tmp-p_long_offset),1);
-         p_print_log(P_LKRG_INFO, "Setup guard page before configuration page.\n");
+         p_debug_log(P_LOG_DEBUG, "Setup guard page before configuration page");
          if (*(p_long_tmp+p_long_offset*2) == P_LKRG_MARKER2) {
-            p_print_log(P_LKRG_INFO, "Found next marker after configuration page.\n");
+            p_debug_log(P_LOG_DEBUG, "Found next marker after configuration page");
             p_set_memory_np((unsigned long)(p_long_tmp+p_long_offset),1);
-            p_print_log(P_LKRG_INFO, "Setup guard page after configuration page.\n");
+            p_debug_log(P_LOG_DEBUG, "Setup guard page after configuration page");
             p_attr_init++;
          }
 #endif
@@ -125,58 +140,44 @@ void p_init_page_attr(void) {
          flush_tlb_all();
 #endif
 
-#if !defined(CONFIG_ARM)
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
       }
    } else {
-      p_print_log(P_LKRG_CRIT,
-             "ERROR: Can't find marker pages so configuration page is NOT RO :( Continue...\n");
-      p_print_log(P_LKRG_INFO, "*(p_long_tmp[0x%lx]-PAGE_SIZE) => [0x%lx] 0x%lx\n",
+      p_print_log(P_LOG_FAULT, "Can't find marker pages, so configuration page is not read-only");
+      p_debug_log(P_LOG_DEBUG, "*(p_long_tmp[0x%lx]-PAGE_SIZE) => [0x%lx] 0x%lx",
                   (unsigned long)p_long_tmp,
                   (unsigned long)p_long_tmp-p_long_offset,
                   *(p_long_tmp-p_long_offset));
-      p_print_log(P_LKRG_INFO, "*(p_long_tmp[0x%lx]+PAGE_SIZE) => [0x%lx] 0x%lx\n",
+      p_debug_log(P_LOG_DEBUG, "*(p_long_tmp[0x%lx]+PAGE_SIZE) => [0x%lx] 0x%lx",
                   (unsigned long)p_long_tmp,
                   (unsigned long)p_long_tmp+p_long_offset,
                   *(p_long_tmp+p_long_offset));
-      p_print_log(P_LKRG_INFO, "*(p_long_tmp[0x%lx]+2*PAGE_SIZE) => [0x%lx] 0x%lx\n",
+      p_debug_log(P_LOG_DEBUG, "*(p_long_tmp[0x%lx]+2*PAGE_SIZE) => [0x%lx] 0x%lx",
                   (unsigned long)p_long_tmp,
                   (unsigned long)p_long_tmp+2*p_long_offset,
                   *(p_long_tmp+2*p_long_offset));
-      p_print_log(P_LKRG_INFO, "*(p_long_tmp[0x%lx]+3*PAGE_SIZE) => [0x%lx] 0x%lx\n",
-                  (unsigned long)p_long_tmp,
-                  (unsigned long)p_long_tmp+3*p_long_offset,
-                  *(p_long_tmp+3*p_long_offset));
    }
 #endif
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_init_page_attr>\n");
-
 }
 
-void p_uninit_page_attr(void) {
+static void p_uninit_page_attr(void) {
 
-   unsigned long *p_long_tmp = 0x0;
-#if !defined(CONFIG_ARM)
+   unsigned long *p_long_tmp = 0;
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
    unsigned long p_long_offset = PAGE_SIZE/sizeof(p_long_tmp); // On purpose sizeof pointer
 #endif
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_uninit_page_attr>\n");
 
    if (p_attr_init) {
       p_long_tmp = (unsigned long *)P_CTRL_ADDR;
       p_set_memory_rw((unsigned long)p_long_tmp,1);
-      p_print_log(P_LKRG_INFO, "Configuration page marked read-write.\n");
-#if !defined(CONFIG_ARM)
+      p_debug_log(P_LOG_DEBUG, "Configuration page marked read-write");
+#if !defined(CONFIG_ARM) && (!defined(P_KERNEL_AGGRESSIVE_INLINING) && defined(CONFIG_X86))
       p_set_memory_p((unsigned long)(p_long_tmp-p_long_offset),1);
-      p_print_log(P_LKRG_INFO, "Disabled guard page before configuration page.\n");
+      p_debug_log(P_LOG_DEBUG, "Disabled guard page before configuration page");
       p_set_memory_rw((unsigned long)(p_long_tmp-p_long_offset),1);
       *(p_long_tmp-p_long_offset) = P_LKRG_MARKER1;
       if (p_attr_init > 1) {
-         p_print_log(P_LKRG_INFO, "Disabled guard page after configuration page.\n");
+         p_debug_log(P_LOG_DEBUG, "Disabled guard page after configuration page");
          p_set_memory_p((unsigned long)(p_long_tmp+p_long_offset),1);
          p_set_memory_rw((unsigned long)(p_long_tmp+p_long_offset),1);
          *(p_long_tmp+p_long_offset) = P_LKRG_MARKER1;
@@ -190,15 +191,10 @@ void p_uninit_page_attr(void) {
 #endif
       schedule();
    } else {
-      p_print_log(P_LKRG_INFO, "Configuration page was NOT RO.\n");
+      p_print_log(P_LOG_FAULT, "Configuration page was not read-only");
    }
 
    p_attr_init ^= p_attr_init;
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_uninit_page_attr>\n");
-
 }
 
 void p_parse_module_params(void) {
@@ -213,8 +209,8 @@ void p_parse_module_params(void) {
    }
 
    /* log_level */
-   if (log_level >= P_LOG_LEVEL_MAX) {
-      P_CTRL(p_log_level) = P_LOG_LEVEL_MAX-1;      // Max
+   if (log_level > P_LOG_MAX) {
+      P_CTRL(p_log_level) = P_LOG_MAX;
    } else {
       P_CTRL(p_log_level) = log_level;
    }
@@ -236,85 +232,85 @@ void p_parse_module_params(void) {
    /* kint_validate */
    if (kint_validate > 3) {
       P_CTRL(p_kint_validate) = 3;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    } else if (P_CTRL(p_kint_validate) != kint_validate) {
       P_CTRL(p_kint_validate) = kint_validate;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    }
 
    /* kint_enforce */
    if (kint_enforce > 2) {
       P_CTRL(p_kint_enforce) = 2;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    } else if (P_CTRL(p_kint_enforce) != kint_enforce) {
       P_CTRL(p_kint_enforce) = kint_enforce;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    }
 
    /* msr_validate */
    if (msr_validate > 1) {
       P_CTRL(p_msr_validate) = 1;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    } else if (P_CTRL(p_msr_validate) != msr_validate) {
       P_CTRL(p_msr_validate) = msr_validate;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    }
 
    /* pint_validate */
    if (pint_validate > 3) {
       P_CTRL(p_pint_validate) = 3;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    } else if (P_CTRL(p_pint_validate) != pint_validate) {
       P_CTRL(p_pint_validate) = pint_validate;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    }
 
    /* pint_enforce */
    if (pint_enforce > 2) {
       P_CTRL(p_pint_enforce) = 2;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    } else if (P_CTRL(p_pint_enforce) != pint_enforce) {
       P_CTRL(p_pint_enforce) = pint_enforce;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    }
 
    /* umh_validate */
    if (umh_validate > 2) {
       P_CTRL(p_umh_validate) = 2;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    } else if (P_CTRL(p_umh_validate) != umh_validate) {
       P_CTRL(p_umh_validate) = umh_validate;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    }
 
    /* umh_enforce */
    if (umh_enforce > 2) {
       P_CTRL(p_umh_enforce) = 2;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    } else if (P_CTRL(p_umh_enforce) != umh_enforce) {
       P_CTRL(p_umh_enforce) = umh_enforce;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    }
 
    /* pcfi_validate */
    if (pcfi_validate > 2) {
       P_CTRL(p_pcfi_validate) = 2;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    } else if (P_CTRL(p_pcfi_validate) != pcfi_validate) {
       P_CTRL(p_pcfi_validate) = pcfi_validate;
-      P_CTRL(p_profile_validate) = 0x9;
+      P_CTRL(p_profile_validate) = 9;
    }
 
    /* pcfi_enforce */
    if (pcfi_enforce > 2) {
       P_CTRL(p_pcfi_enforce) = 2;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    } else if (P_CTRL(p_pcfi_enforce) != pcfi_enforce) {
       P_CTRL(p_pcfi_enforce) = pcfi_enforce;
-      P_CTRL(p_profile_enforce) = 0x9;
+      P_CTRL(p_profile_enforce) = 9;
    }
 
-   p_pcfi_CPU_flags = 0x0;
+   p_pcfi_CPU_flags = 0;
 
 #if defined(CONFIG_X86)
 
@@ -324,25 +320,24 @@ void p_parse_module_params(void) {
       /* smep_validate */
       if (smep_validate > 1) {
          P_CTRL(p_smep_validate) = 1;
-         P_CTRL(p_profile_validate) = 0x9;
+         P_CTRL(p_profile_validate) = 9;
       } else if (P_CTRL(p_smep_validate) != smep_validate) {
          P_CTRL(p_smep_validate) = smep_validate;
-         P_CTRL(p_profile_validate) = 0x9;
+         P_CTRL(p_profile_validate) = 9;
       }
 
       /* smep_enforce */
       if (smep_enforce > 2) {
          P_CTRL(p_smep_enforce) = 2;
-         P_CTRL(p_profile_enforce) = 0x9;
+         P_CTRL(p_profile_enforce) = 9;
       } else if (P_CTRL(p_smep_enforce) != smep_enforce) {
          P_CTRL(p_smep_enforce) = smep_enforce;
-         P_CTRL(p_profile_enforce) = 0x9;
+         P_CTRL(p_profile_enforce) = 9;
       }
    } else {
-      P_CTRL(p_smep_validate) = 0x0;
-      P_CTRL(p_smep_enforce) = 0x0;
-      p_print_log(P_LKRG_ERR,
-            "System does NOT support SMEP. LKRG can't enforce SMEP validation :(\n");
+      P_CTRL(p_smep_validate) = 0;
+      P_CTRL(p_smep_enforce) = 0;
+      p_print_log(P_LOG_ISSUE, "System does not support SMEP, which won't be validated");
    }
 
    if (boot_cpu_has(X86_FEATURE_SMAP)) {
@@ -351,25 +346,24 @@ void p_parse_module_params(void) {
       /* smap_validate */
       if (smap_validate > 1) {
          P_CTRL(p_smap_validate) = 1;
-         P_CTRL(p_profile_validate) = 0x9;
+         P_CTRL(p_profile_validate) = 9;
       } else if (P_CTRL(p_smap_validate) != smap_validate) {
          P_CTRL(p_smap_validate) = smap_validate;
-         P_CTRL(p_profile_validate) = 0x9;
+         P_CTRL(p_profile_validate) = 9;
       }
 
       /* smap_enforce */
       if (smap_enforce > 2) {
          P_CTRL(p_smap_enforce) = 2;
-         P_CTRL(p_profile_enforce) = 0x9;
+         P_CTRL(p_profile_enforce) = 9;
       } else if (P_CTRL(p_smap_enforce) != smap_enforce) {
          P_CTRL(p_smap_enforce) = smap_enforce;
-         P_CTRL(p_profile_enforce) = 0x9;
+         P_CTRL(p_profile_enforce) = 9;
       }
    } else {
-      P_CTRL(p_smap_validate) = 0x0;
-      P_CTRL(p_smap_enforce) = 0x0;
-      p_print_log(P_LKRG_ERR,
-            "System does NOT support SMAP. LKRG can't enforce SMAP validation :(\n");
+      P_CTRL(p_smap_validate) = 0;
+      P_CTRL(p_smap_enforce) = 0;
+      p_print_log(P_LOG_ISSUE, "System does not support SMAP, which won't be validated");
    }
 
    P_ENABLE_WP_FLAG(p_pcfi_CPU_flags);
@@ -384,10 +378,31 @@ void p_parse_module_params(void) {
 static int __init p_lkrg_register(void) {
 
    int p_ret = P_LKRG_SUCCESS;
-   char p_cpu = 0x0;
-   char p_freeze = 0x0;
+   char p_cpu = 0;
+   char p_freeze = 0;
 
-   p_print_log(P_LKRG_CRIT, "Loading LKRG...\n");
+   lkrg_register_net();
+
+   P_SYM(p_state_init) = 0;
+
+   if (get_kallsyms_address() != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_FATAL, "Can't find 'kallsyms_lookup_name'");
+      p_ret = P_LKRG_RESOLVER_ERROR;
+      goto p_main_error;
+   }
+
+   p_debug_log(P_LOG_DEBUG, "kallsyms_lookup_name() => 0x%lx", (unsigned long)P_SYM(p_kallsyms_lookup_name));
+
+   /*
+    * Verify if user disabled loading LKRG from boot parameters
+    */
+   if (p_verify_boot_params()) {
+      p_print_log(P_LOG_DYING, "Not loading LKRG ('" P_BOOT_DISABLE_LKRG "' kernel boot parameter detected)");
+      lkrg_deregister_net();
+      return P_LKRG_BOOT_DISABLE_LKRG;
+   }
+
+   p_print_log(P_LOG_ALIVE, "Loading LKRG");
 
    /*
     * Generate random SipHash key
@@ -398,66 +413,57 @@ static int __init p_lkrg_register(void) {
    p_parse_module_params();
    P_SYM(p_find_me) = THIS_MODULE;
 
-   if (get_kallsyms_address() != P_LKRG_SUCCESS) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't find kallsyms_lookup_name() function address! Exiting...\n");
-      return P_LKRG_RESOLVER_ERROR;
+   /*
+    * Verify if kprobes run as intended
+    */
+
+   /* Register kprobes hooks necessary to verify kprobes itself */
+   if (p_install_lkrg_dummy_hook(0)) {
+      p_print_log(P_LOG_FATAL, "Can't hook 'lkrg_dummy'");
+      return P_LKRG_GENERAL_ERROR;
    }
-#ifdef P_LKRG_DEBUG
-     else {
-        p_print_log(P_LKRG_DBG,
-               "kallsyms_lookup_name() => 0x%lx\n",(unsigned long)P_SYM(p_kallsyms_lookup_name));
-     }
+
+   /* Verify kprobes now */
+   if (lkrg_verify_kprobes()) {
+      /*
+       * Kprobes does not work as intended.
+       * LKRG can't function without it, stop initialization!
+       */
+      p_print_log(P_LOG_FATAL, "Can't continue initialization without working kprobes");
+      p_uninstall_lkrg_dummy_hook();
+      return P_LKRG_GENERAL_ERROR;
+   }
+
+   P_SYM_INIT(freeze_processes)
+   P_SYM_INIT(thaw_processes)
+#if defined(CONFIG_X86) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
+   P_SYM_INIT(native_write_cr4)
 #endif
-
-   P_SYM(p_freeze_processes) = (int (*)(void))P_SYM(p_kallsyms_lookup_name)("freeze_processes");
-
-   if (!P_SYM(p_freeze_processes)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'freeze_processes' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
-
-   P_SYM(p_thaw_processes) = (void (*)(void))P_SYM(p_kallsyms_lookup_name)("thaw_processes");
-
-   if (!P_SYM(p_thaw_processes)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'thaw_processes' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
-   P_SYM(p_native_write_cr4) = (void (*)(unsigned long))P_SYM(p_kallsyms_lookup_name)("native_write_cr4");
-
-   if (!P_SYM(p_native_write_cr4)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'native_write_cr4' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
+#ifdef P_LKRG_UNEXPORTED_MODULE_ADDRESS
+   P_SYM_INIT(__module_address)
+   P_SYM_INIT(__module_text_address)
+#endif
+#if defined(CONFIG_OPTPROBES)
+   P_SYM_INIT(wait_for_kprobe_optimizer)
 #endif
 
    // Freeze all non-kernel processes
    while (P_SYM(p_freeze_processes)())
       schedule();
 
-   p_freeze = 0x1;
+   p_freeze = 1;
 
    /*
     * First, we need to plant *kprobes... Before DB is created!
     */
    if (p_exploit_detection_init()) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't initialize exploit detection features! Exiting...\n");
+      p_print_log(P_LOG_FATAL, "Can't initialize exploit detection features");
       p_ret = P_LKRG_EXPLOIT_DETECTION_ERROR;
       goto p_main_error;
    }
 
    if (p_offload_cache_init()) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't initialize offloading cache :(\n");
+      p_print_log(P_LOG_FATAL, "Can't initialize cache for system integrity WQ");
       p_ret = P_LKRG_GENERAL_ERROR;
       goto p_main_error;
    }
@@ -466,15 +472,13 @@ static int __init p_lkrg_register(void) {
     * Initialize kmod module
     */
    if (p_kmod_init()) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't initialize kernel modules handling! Exiting...\n");
+      p_print_log(P_LOG_FATAL, "Can't initialize kernel module handling");
       p_ret = P_LKRG_KMOD_ERROR;
       goto p_main_error;
    }
 
    if (p_create_database() != P_LKRG_SUCCESS) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't create database! Exiting...\n");
+      p_print_log(P_LOG_FATAL, "Can't create database");
       p_ret = P_LKRG_DATABASE_ERROR;
       goto p_main_error;
    }
@@ -489,68 +493,42 @@ static int __init p_lkrg_register(void) {
 #endif
 #else
    if ( (p_hot_cpus = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
-                         "x86/p_lkrg:online",
+                         "x86/lkrg:online",
                          p_cpu_online_action,
                          p_cpu_dead_action)) < 0) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't register hot CPU plug[in/out] handler! Exiting...\n");
+      p_print_log(P_LOG_FATAL, "Can't register hot CPU plug[in/out] handler");
       p_ret = P_LKRG_HPCPU_ERROR;
       goto p_main_error;
    }
 #endif
-   p_cpu = 0x1;
+   p_cpu = 1;
 
 #if !defined(CONFIG_ARM64)
-
-   P_SYM(p_flush_tlb_all) = (void (*)(void))P_SYM(p_kallsyms_lookup_name)("flush_tlb_all");
-
-   if (!P_SYM(p_flush_tlb_all)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'flush_tlb_all' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
-
+   P_SYM_INIT(flush_tlb_all)
 #endif
 
+#if defined(P_KERNEL_AGGRESSIVE_INLINING)
+   P_SYM_INIT(set_memory_ro)
+   P_SYM_INIT(set_memory_rw)
 
-#if defined(CONFIG_X86)
-
-   P_SYM(p_change_page_attr_set_clr) =
-          (int (*)(unsigned long *, int, pgprot_t, pgprot_t, int, int, struct page **))
-          P_SYM(p_kallsyms_lookup_name)("change_page_attr_set_clr");
-
-   if (!P_SYM(p_change_page_attr_set_clr)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'change_page_attr_set_clr' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
-
-#elif defined(CONFIG_ARM) || defined(CONFIG_ARM64)
-
-   P_SYM(p_change_memory_common) =
-          (int (*)(unsigned long, int, pgprot_t, pgprot_t))
-          P_SYM(p_kallsyms_lookup_name)("change_memory_common");
-
-   if (!P_SYM(p_change_memory_common)) {
-      p_print_log(P_LKRG_ERR,
-             "ERROR: Can't find 'change_memory_common' function :( Exiting...\n");
-      p_ret = P_LKRG_GENERAL_ERROR;
-      goto p_main_error;
-   }
+ #if defined(CONFIG_ARM64)
+   P_SYM_INIT(set_memory_valid)
+ #endif
 
 #else
-
-   p_print_log(P_LKRG_CRIT, "UNSUPPORTED PLATFORM! Exiting...\n");
+ #if defined(CONFIG_X86)
+   P_SYM_INIT(change_page_attr_set_clr)
+ #elif defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+   P_SYM_INIT(change_memory_common)
+ #else
+   p_print_log(P_LOG_FATAL, "Unsupported platform");
    p_ret = P_LKRG_GENERAL_ERROR;
    goto p_main_error;
-
+ #endif
 #endif
 
    if (p_register_comm_channel()) {
-      p_print_log(P_LKRG_CRIT,
-             "Can't initialize communication channel (sysctl) :(\n");
+      p_print_log(P_LOG_FATAL, "Can't initialize sysctl");
       p_ret = P_LKRG_GENERAL_ERROR;
       goto p_main_error;
    }
@@ -563,14 +541,14 @@ static int __init p_lkrg_register(void) {
    p_register_notifiers();
    p_init_page_attr();
 
-   p_print_log(P_LKRG_CRIT,
-          "LKRG initialized successfully!\n");
+   p_print_log(P_LOG_ALIVE, "LKRG initialized successfully");
 
    p_ret = P_LKRG_SUCCESS;
 
 p_main_error:
 
    if (p_ret != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_DYING, "Not loading LKRG (initialization failed)");
       P_CTRL(p_kint_validate) = 0;
       p_deregister_notifiers();
       if (p_timer.function)
@@ -595,11 +573,13 @@ p_main_error:
       p_unregister_arch_metadata();
       p_offload_cache_delete();
       p_deregister_module_notifier();
+      p_uninstall_lkrg_dummy_hook();
       if (p_db.p_CPU_metadata_array) {
-         kzfree(p_db.p_CPU_metadata_array);
+         p_kzfree(p_db.p_CPU_metadata_array);
          p_db.p_CPU_metadata_array = NULL;
       }
-      p_uninit_page_attr();
+      if (p_attr_init)
+         p_uninit_page_attr();
 #if defined(P_LKRG_JUMP_LABEL_STEXT_DEBUG)
       if (p_db.kernel_stext_copy)
          vfree(p_db.kernel_stext_copy);
@@ -609,10 +589,17 @@ p_main_error:
    if (p_freeze) {
       // Thaw all non-kernel processes
       P_SYM(p_thaw_processes)();
-      p_freeze = 0x0;
+      p_freeze = 0;
    }
 
+   if (p_ret != P_LKRG_SUCCESS)
+      lkrg_deregister_net();
+
    return p_ret;
+
+p_sym_error:
+   p_ret = P_LKRG_GENERAL_ERROR;
+   goto p_main_error;
 }
 
 /*
@@ -620,12 +607,7 @@ p_main_error:
  */
 static void __exit p_lkrg_deregister(void) {
 
-   p_print_log(P_LKRG_CRIT, "Unloading LKRG...\n");
-
-#ifdef P_LKRG_DEBUG
-   p_print_log(P_LKRG_DBG,
-          "I should never be here! This operation probably is going to break your system! Goodbye ;)\n");
-#endif
+   p_print_log(P_LOG_DYING, "Unloading LKRG");
 
    p_uninit_page_attr();
 
@@ -654,13 +636,13 @@ static void __exit p_lkrg_deregister(void) {
 #endif
 
    p_exploit_detection_exit();
-   p_offload_cache_delete();
    p_unregister_arch_metadata();
+   p_offload_cache_delete();
    p_deregister_module_notifier();
-
+   p_uninstall_lkrg_dummy_hook();
 
    if (p_db.p_CPU_metadata_array)
-      kzfree(p_db.p_CPU_metadata_array);
+      p_kzfree(p_db.p_CPU_metadata_array);
 
 #if defined(P_LKRG_JUMP_LABEL_STEXT_DEBUG)
    if (p_db.kernel_stext_copy)
@@ -670,15 +652,21 @@ static void __exit p_lkrg_deregister(void) {
    // Thaw all non-kernel processes
    P_SYM(p_thaw_processes)();
 
-   p_print_log(P_LKRG_CRIT, "LKRG unloaded!\n");
+   p_print_log(P_LOG_DYING, "LKRG unloaded");
+
+   lkrg_deregister_net();
 }
 
 
+#ifdef MODULE
 module_init(p_lkrg_register);
+#else
+late_initcall_sync(p_lkrg_register);
+#endif
 module_exit(p_lkrg_deregister);
 
 module_param(log_level, uint, 0000);
-MODULE_PARM_DESC(log_level, "log_level [3 (warn) is default]");
+MODULE_PARM_DESC(log_level, "log_level [3 (issue) is default]");
 module_param(heartbeat, uint, 0000);
 MODULE_PARM_DESC(heartbeat, "heartbeat [0 (don't print) is default]");
 module_param(block_modules, uint, 0000);
@@ -692,7 +680,7 @@ MODULE_PARM_DESC(kint_enforce, "kint_enforce [2 (panic) is default]");
 module_param(msr_validate, uint, 0000);
 MODULE_PARM_DESC(msr_validate, "msr_validate [0 (disabled) is default]");
 module_param(pint_validate, uint, 0000);
-MODULE_PARM_DESC(pint_validate, "pint_validate [2 (current + waking up) is default]");
+MODULE_PARM_DESC(pint_validate, "pint_validate [1 (current) is default]");
 module_param(pint_enforce, uint, 0000);
 MODULE_PARM_DESC(pint_enforce, "pint_enforce [1 (kill task) is default]");
 module_param(umh_validate, uint, 0000);

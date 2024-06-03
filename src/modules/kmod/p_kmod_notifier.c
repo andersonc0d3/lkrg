@@ -2,7 +2,7 @@
  * pi3's Linux kernel Runtime Guard
  *
  * Component:
- *  - Kernel's modules module notifier 
+ *  - Kernel's modules module notifier
  *
  * Notes:
  *  - Register notifier function whenever there is any kernel module load/unload activity
@@ -31,20 +31,20 @@ static struct notifier_block p_module_block_notifier = {
 };
 
 
+static int p_block_always(void) {
+
+   p_print_log(P_LOG_WATCH, "Module loading blocked");
+
+   return P_LKRG_GENERAL_ERROR;
+
+}
+
 static void p_module_notifier_wrapper(unsigned long p_event, struct module *p_kmod) {
 
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_module_notifier_wrapper>\n");
-
    if (P_CTRL(p_block_modules)) {
+      p_print_log(P_LOG_ALERT, "BLOCK: Module: Loading of module name %s", p_kmod->name);
       p_kmod->init = p_block_always;
    }
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_module_notifier_wrapper>\n");
 
    return;
 }
@@ -66,19 +66,18 @@ static int p_module_event_notifier(struct notifier_block *p_this, unsigned long 
 
    struct module *p_tmp = p_kmod;
 
-// STRONG_DEBUG
-#ifdef P_LKRG_DEBUG
-   char *p_mod_strings[] = { "New module is LIVE",
+   static const char * const p_mod_strings[] = {
+                             "New module is LIVE",
                              "New module is COMING",
                              "Module is GOING AWAY",
                              "New module is UNFORMED yet" };
-#endif
 
 // STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-               "[%ld | %s] Entering function <p_module_event_notifier> m[0x%lx] hd[0x%lx] s[0x%lx] n[0x%lx]\n",
+   p_debug_log(P_LOG_FLOOD,
+               "[%ld | %s | %s] Entering function <p_module_event_notifier> m[0x%lx] hd[0x%lx] s[0x%lx] n[0x%lx]",
                p_event,
                p_mod_strings[p_event],
+               p_tmp->name,
                (unsigned long)p_tmp,
                (unsigned long)p_tmp->holders_dir,
                (unsigned long)p_tmp->sect_attrs,
@@ -89,8 +88,8 @@ static int p_module_event_notifier(struct notifier_block *p_this, unsigned long 
    p_module_activity_ptr = p_tmp;
 
 // DEBUG
-   p_debug_log(P_LKRG_DBG,
-          "<p_module_event_notifier> !! Module activity detected [<%s>] %lu: 0x%lx\n",
+   p_debug_log(P_LOG_DEBUG,
+          "<p_module_event_notifier> !! Module activity detected [<%s>] %lu: 0x%lx",
           p_mod_strings[p_event],
           p_event,
           (unsigned long)p_kmod);
@@ -102,10 +101,10 @@ static int p_module_event_notifier(struct notifier_block *p_this, unsigned long 
 //   if (p_tmp->state == MODULE_STATE_GOING) { <- Linux kernel bug - might not update state value :(
    if (p_event == MODULE_STATE_GOING) {
 
-      get_online_cpus();
+      p_read_cpu_lock();
       on_each_cpu(p_dump_CPU_metadata,p_db.p_CPU_metadata_array,true);
       p_db.p_CPU_metadata_hashes = hash_from_CPU_data(p_db.p_CPU_metadata_array);
-      put_online_cpus();
+      p_read_cpu_unlock();
 
       /*
        * Now recalculate modules information in database!
@@ -115,22 +114,9 @@ static int p_module_event_notifier(struct notifier_block *p_this, unsigned long 
        * Because some module is going to be unloaded from the kernel
        * We must keep in track that information ;)
        */
-
-p_module_event_notifier_going_retry:
+      p_verify_module_going(p_tmp);
 
       p_text_section_lock();
-      /* We are heavily consuming module list here - take 'module_mutex' */
-//      mutex_lock(&module_mutex);
-      while (!mutex_trylock(&module_mutex)) {
-         p_text_section_unlock();
-         schedule();
-         goto  p_module_event_notifier_going_retry;
-      }
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-      /* Hacky way of 'stopping' KOBJs activities */
-      mutex_lock(P_SYM(p_kernfs_mutex));
-#endif
-
       /*
        * First, synchronize possible database changes with other LKRG components...
        * We want to be as fast as possible to get this lock! :)
@@ -165,14 +151,13 @@ p_module_event_notifier_going_retry:
                                              (unsigned int)p_db.p_module_kobj_nr * sizeof(p_module_kobj_mem));
       /* We should be fine now! */
 
-      p_print_log(P_LKRG_INFO,"Hash from 'module list' => [0x%llx]\n",p_db.p_module_list_hash);
-      p_print_log(P_LKRG_INFO,"Hash from 'module kobj(s)' => [0x%llx]\n",p_db.p_module_kobj_hash);
+      p_print_log(P_LOG_WATCH,"Hash from 'module list' => [0x%llx]",p_db.p_module_list_hash);
+      p_print_log(P_LOG_WATCH,"Hash from 'module kobj(s)' => [0x%llx]",p_db.p_module_kobj_hash);
 
       if (hash_from_kernel_stext() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "[module_notifier:%s] Can't recalculate hash from _STEXT!\n",p_mod_strings[p_event]);
+         p_print_log(P_LOG_FAULT, "Can't recalculate hash of a module (%s)", p_mod_strings[p_event]);
       }
-      p_print_log(P_LKRG_INFO,"Hash from '_stext' => [0x%llx]\n",p_db.kernel_stext.p_hash);
+      p_print_log(P_LOG_WATCH,"Hash from '_stext' => [0x%llx]",p_db.kernel_stext.p_hash);
 
       goto p_module_event_notifier_unlock_out;
    }
@@ -188,32 +173,19 @@ p_module_event_notifier_going_retry:
 //      if (p_tmp->state == MODULE_STATE_LIVE) { <- Linux kernel bug - might not update state value :(
       if (p_event == MODULE_STATE_LIVE) {
 
-         get_online_cpus();
+         p_read_cpu_lock();
          on_each_cpu(p_dump_CPU_metadata,p_db.p_CPU_metadata_array,true);
          p_db.p_CPU_metadata_hashes = hash_from_CPU_data(p_db.p_CPU_metadata_array);
-         put_online_cpus();
+         p_read_cpu_unlock();
 
          /*
           * Now recalculate modules information in database! Since blocking module is disabled
           * every new module must be add to the internal database, hash from .text section calculated
           * and recalculate global module hashes...
           */
-
-p_module_event_notifier_live_retry:
+         p_verify_module_live(p_tmp);
 
          p_text_section_lock();
-         /* We are heavily consuming module list here - take 'module_mutex' */
-         //mutex_lock(&module_mutex);
-         while (!mutex_trylock(&module_mutex)) {
-            p_text_section_unlock();
-            schedule();
-            goto  p_module_event_notifier_live_retry;
-         }
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-         /* Hacky way of 'stopping' KOBJs activities */
-         mutex_lock(P_SYM(p_kernfs_mutex));
-#endif
-
          /*
           * First, synchronize possible database changes with other LKRG components...
           * We want to be as fast as possible to get this lock! :)
@@ -246,14 +218,13 @@ p_module_event_notifier_live_retry:
                                              (unsigned int)p_db.p_module_kobj_nr * sizeof(p_module_kobj_mem));
          /* We should be fine now! */
 
-         p_print_log(P_LKRG_INFO,"Hash from 'module list' => [0x%llx]\n",p_db.p_module_list_hash);
-         p_print_log(P_LKRG_INFO,"Hash from 'module kobj(s)' => [0x%llx]\n",p_db.p_module_kobj_hash);
+         p_print_log(P_LOG_WATCH,"Hash from 'module list' => [0x%llx]",p_db.p_module_list_hash);
+         p_print_log(P_LOG_WATCH,"Hash from 'module kobj(s)' => [0x%llx]",p_db.p_module_kobj_hash);
 
          if (hash_from_kernel_stext() != P_LKRG_SUCCESS) {
-            p_print_log(P_LKRG_CRIT,
-               "[module_notifier:%s] Can't recalculate hash from _STEXT!\n",p_mod_strings[p_event]);
+            p_print_log(P_LOG_FAULT, "Can't recalculate hash of a module (%s)", p_mod_strings[p_event]);
          }
-         p_print_log(P_LKRG_INFO,"Hash from '_stext' => [0x%llx]\n",p_db.kernel_stext.p_hash);
+         p_print_log(P_LOG_WATCH,"Hash from '_stext' => [0x%llx]",p_db.kernel_stext.p_hash);
 
          goto p_module_event_notifier_unlock_out;
       }
@@ -266,12 +237,6 @@ p_module_event_notifier_unlock_out:
    /* God mode off ;) */
 //   spin_unlock_irqrestore(&p_db_lock,p_db_flags);
    spin_unlock(&p_db_lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-   /* unlock KOBJ activities */
-   mutex_unlock(P_SYM(p_kernfs_mutex));
-#endif
-   /* Release the 'module_mutex' */
-   mutex_unlock(&module_mutex);
    p_text_section_unlock();
 
 p_module_event_notifier_activity_out:
@@ -279,27 +244,81 @@ p_module_event_notifier_activity_out:
    /* Inform validation routine about active module activities... */
    mutex_unlock(&p_module_activity);
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_module_event_notifier>\n");
-
    return NOTIFY_DONE;
 }
 
-int p_block_always(void) {
+void p_verify_module_live(struct module *p_mod) {
 
-   p_print_log(P_LKRG_CRIT,
-          "!! Module insertion blocked (from always!) !!\n");
+#if P_OVL_OVERRIDE_SYNC_MODE
+   if (p_ovl_override_sync_kretprobe_state) {
+      /* We do not need to do anything for now */
+      return;
+   }
 
-   return P_LKRG_GENERAL_ERROR;
+   if (!strcmp(p_mod->name,"overlay") || !strcmp(p_mod->name,"overlay2")) {
+      unsigned int p_tmp_val;
+
+      /*
+       * OK, we must try to hook 'ovl_create_or_link' function.
+       * Otherwise LKRG will be incompatible with docker.
+       *
+       * First, we would need to synchronize with LKRG integrity feature.
+       */
+      p_tmp_val = P_CTRL(p_kint_validate);
+      p_lkrg_open_rw();
+      P_CTRL(p_kint_validate) = 0;
+      p_lkrg_close_rw();
+      /* Try to install the hook */
+      if (p_install_ovl_override_sync_hook(1)) {
+         p_print_log(P_LOG_FAULT,
+                "OverlayFS is being loaded but LKRG can't hook '" P_OVL_OVERRIDE_SYNC_FUNC "'. "
+                "It is very likely that LKRG will produce false positives. Please reload LKRG.");
+      }
+      /* Done */
+      p_lkrg_open_rw();
+      P_CTRL(p_kint_validate) = p_tmp_val;
+      p_lkrg_close_rw();
+   }
+#endif
+}
+
+void p_verify_module_going(struct module *p_mod) {
+
+#if P_OVL_OVERRIDE_SYNC_MODE
+   if (!p_ovl_override_sync_kretprobe_state) {
+      /* We do not need to do anything for now */
+      return;
+   }
+
+   if (!strcmp(p_mod->name,"overlay") || !strcmp(p_mod->name,"overlay2")) {
+      unsigned int p_tmp_val;
+
+      /*
+       * OK, we must try to remove our hook @ 'ovl_create_or_link' function.
+       *
+       * First, we would need to synchronize with LKRG integrity feature.
+       */
+      p_tmp_val = P_CTRL(p_kint_validate);
+      p_lkrg_open_rw();
+      P_CTRL(p_kint_validate) = 0;
+      p_lkrg_close_rw();
+      /* Try to uninstall the hook */
+      p_uninstall_ovl_override_sync_hook();
+      p_reinit_ovl_override_sync_kretprobe();
+      /* Done */
+      p_lkrg_open_rw();
+      P_CTRL(p_kint_validate) = p_tmp_val;
+      p_lkrg_close_rw();
+   }
+#endif
 
 }
 
 void p_register_module_notifier(void) {
 
 // STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "<p_register_module_notifier> Registering module's noitifier routine\n");
+   p_debug_log(P_LOG_FLOOD,
+          "<p_register_module_notifier> Registering module's noitifier routine");
 
    register_module_notifier(&p_module_block_notifier);
 
@@ -310,17 +329,15 @@ void p_deregister_module_notifier(void) {
    unregister_module_notifier(&p_module_block_notifier);
 
    if (p_db.p_module_list_array) {
-      kzfree(p_db.p_module_list_array);
+      p_kzfree(p_db.p_module_list_array);
       p_db.p_module_list_array = NULL;
    }
    if (p_db.p_module_kobj_array) {
-      kzfree(p_db.p_module_kobj_array);
+      p_kzfree(p_db.p_module_kobj_array);
       p_db.p_module_kobj_array = NULL;
    }
    if (p_db.p_jump_label.p_mod_mask) {
       kfree(p_db.p_jump_label.p_mod_mask);
       p_db.p_jump_label.p_mod_mask = NULL;
    }
-
-//   printk("Goodbye ;)\n");
 }

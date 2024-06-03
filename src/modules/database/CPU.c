@@ -50,11 +50,7 @@
 
 void p_get_cpus(p_cpu_info *p_arg) {
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_get_cpus>\n");
-
-   memset(p_arg,0x0,sizeof(p_cpu_info));
+   memset(p_arg,0,sizeof(p_cpu_info));
 
    p_arg->online_CPUs = num_online_cpus();
    p_arg->possible_CPUs = num_possible_cpus();
@@ -63,55 +59,33 @@ void p_get_cpus(p_cpu_info *p_arg) {
 
    p_arg->p_nr_cpu_ids = nr_cpu_ids;
 
-   p_debug_log(P_LKRG_DBG,
-//   p_print_log(P_LKRG_CRIT,
-          "<p_get_cpus> online[%d] possible[%d] present[%d] active[%d] nr_cpu_ids[%d]\n",
+   p_debug_log(P_LOG_DEBUG,
+          "<p_get_cpus> online[%d] possible[%d] present[%d] active[%d] nr_cpu_ids[%d]",
           p_arg->online_CPUs,p_arg->possible_CPUs,p_arg->present_CPUs,p_arg->active_CPUs,
           p_arg->p_nr_cpu_ids);
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_get_cpus>\n");
-
 }
 
-int p_cmp_cpus(p_cpu_info *p_arg1, p_cpu_info *p_arg2) {
+int p_cmp_cpus(p_cpu_info *p_orig, p_cpu_info *p_current) {
 
-   int p_flag = 0x0;
+   int p_flag = 0;
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_cmp_cpus>\n");
-
-   if (p_arg1->online_CPUs != p_arg2->online_CPUs) {
-      p_print_log(P_LKRG_CRIT,
-             "ALERT !!! NUMBER OF ONLINE CPUs IS DIFFERENT !!!\n");
-      p_flag++;
-   }
-   if (p_arg1->possible_CPUs != p_arg2->possible_CPUs) {
-      p_print_log(P_LKRG_CRIT,
-             "ALERT !!! NUMBER OF POSSIBLE CPUs IS DIFFERENT !!!\n");
-      p_flag++;
-   }
-   if (p_arg1->present_CPUs != p_arg2->present_CPUs) {
-      p_print_log(P_LKRG_CRIT,
-             "ALERT !!! NUMBER OF PRESENT CPUs IS DIFFERENT !!!\n");
-      p_flag++;
-   }
-   if (p_arg1->active_CPUs != p_arg2->active_CPUs) {
-      p_print_log(P_LKRG_CRIT,
-             "ALERT !!! NUMBER OF ACTIVE CPUs IS DIFFERENT !!!\n");
-      p_flag++;
-   }
-   if (p_arg1->p_nr_cpu_ids != p_arg2->p_nr_cpu_ids) {
-      p_print_log(P_LKRG_CRIT,
-             "ALERT !!! VARIABLE 'nr_cpu_ids' IS DIFFERENT !!!\n");
-      p_flag++;
+#define P_CMP_CPU(which) \
+   if (p_orig->which ## _CPUs != p_current->which ## _CPUs) { \
+      p_print_log(P_LOG_FAULT, "Number of " #which " CPUs changed unexpectedly (expected %u, actual %u)", \
+         p_orig->which ## _CPUs, p_current->which ## _CPUs); \
+      p_flag++; \
    }
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_cmp_cpus>\n");
+   P_CMP_CPU(online)
+   P_CMP_CPU(possible)
+   P_CMP_CPU(present)
+   P_CMP_CPU(active)
+
+   if (p_orig->p_nr_cpu_ids != p_current->p_nr_cpu_ids) {
+      p_print_log(P_LOG_FAULT, "'nr_cpu_ids' changed unexpectedly (expected %u, actual %u)",
+         p_orig->p_nr_cpu_ids, p_current->p_nr_cpu_ids);
+      p_flag++;
+   }
 
    return p_flag;
 }
@@ -125,11 +99,6 @@ int p_cmp_cpus(p_cpu_info *p_arg1, p_cpu_info *p_arg2) {
 int p_cpu_callback(struct notifier_block *p_block, unsigned long p_action, void *p_hcpu) {
 
    unsigned int p_cpu = (unsigned long)p_hcpu;
-
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_cpu_callback>\n");
 
 // TODO: lock db
 //       lock is done in the individual action function
@@ -152,32 +121,52 @@ int p_cpu_callback(struct notifier_block *p_block, unsigned long p_action, void 
 //       lock is done in the individual action function
 //       to reduce locking/starving time
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_cpu_callback>\n");
-
    return NOTIFY_OK;
 }
 #endif
 
+static void p_cpu_rehash(const char *onoffline) {
+   /* First recalculate _STEXT and other critical kernel's data */
+   if (hash_from_ex_table() != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_FAULT, "CPU %s: Can't get hash from exception table", onoffline);
+   }
+   if (hash_from_kernel_stext() != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_FAULT, "CPU %s: Can't get hash from _stext", onoffline);
+   }
+   if (hash_from_kernel_rodata() != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_FAULT, "CPU %s: Can't get hash from _rodata", onoffline);
+   }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,19,0)
+   if (hash_from_iommu_table() != P_LKRG_SUCCESS) {
+      p_print_log(P_LOG_FAULT, "CPU %s: Can't get hash from IOMMU table", onoffline);
+   }
+#endif
+
+   /* Now recalculate modules, again some macros are different now ! */
+
+   /* OK, now recalculate hashes again! */
+   while(p_kmod_hash(&p_db.p_module_list_nr,&p_db.p_module_list_array,
+                     &p_db.p_module_kobj_nr,&p_db.p_module_kobj_array, 0x2) != P_LKRG_SUCCESS)
+      schedule();
+
+   /* Update global module list/kobj hash */
+   p_db.p_module_list_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_list_array,
+                                          (unsigned int)p_db.p_module_list_nr * sizeof(p_module_list_mem));
+
+   p_db.p_module_kobj_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_kobj_array,
+                                          (unsigned int)p_db.p_module_kobj_nr * sizeof(p_module_kobj_mem));
+
+   p_print_log(P_LOG_WATCH, "Hash from 'module list' => [0x%llx]", p_db.p_module_list_hash);
+   p_print_log(P_LOG_WATCH, "Hash from 'module kobj(s)' => [0x%llx]", p_db.p_module_kobj_hash);
+
+   /* We should be fine now! */
+}
 
 int p_cpu_online_action(unsigned int p_cpu) {
 
    int tmp_online_CPUs = p_db.p_cpu.online_CPUs;
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-//   p_print_log(P_LKRG_CRIT,
-          "Entering function <p_cpu_online_action>\n");
-
    p_text_section_lock();
-   /* We are heavily consuming module list here - take 'module_mutex' */
-   mutex_lock(&module_mutex);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-   /* Hacky way of 'stopping' KOBJs activities */
-   mutex_lock(P_SYM(p_kernfs_mutex));
-#endif
-
    spin_lock(&p_db_lock);
 
    smp_call_function_single(p_cpu,p_dump_CPU_metadata,p_db.p_CPU_metadata_array,true);
@@ -193,79 +182,23 @@ int p_cpu_online_action(unsigned int p_cpu) {
 
    /* UP kernel became SMP one! we need to do more work ;/ */
    if (tmp_online_CPUs == 1 && p_db.p_cpu.online_CPUs > 1) {
-      /* First recalculate _STEXT and other critical kernel's data - now is SMPbooted! */
-      if (hash_from_ex_table() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU ONLINE ERROR: CANNOT GET HASH FROM EXCEPTION TABLE!\n");
-      }
-      if (hash_from_kernel_stext() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU ONLINE ERROR: CANNOT GET HASH FROM _STEXT!\n");
-      }
-      if (hash_from_kernel_rodata() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU ONLINE ERROR: CANNOT GET HASH FROM _RODATA!\n");
-      }
-      if (hash_from_iommu_table() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU ONLINE ERROR: CANNOT GET HASH FROM IOMMU TABLE!\n");
-      }
-      /* Now recalculate modules, again some macros are different now ! */
-
-      /* OK, now recalculate hashes again! */
-      while(p_kmod_hash(&p_db.p_module_list_nr,&p_db.p_module_list_array,
-                        &p_db.p_module_kobj_nr,&p_db.p_module_kobj_array, 0x2) != P_LKRG_SUCCESS)
-         schedule();
-
-      /* Update global module list/kobj hash */
-      p_db.p_module_list_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_list_array,
-                                             (unsigned int)p_db.p_module_list_nr * sizeof(p_module_list_mem));
-
-      p_db.p_module_kobj_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_kobj_array,
-                                             (unsigned int)p_db.p_module_kobj_nr * sizeof(p_module_kobj_mem));
-
-      p_print_log(P_LKRG_INFO,"Hash from 'module list' => [0x%llx]\n",p_db.p_module_list_hash);
-      p_print_log(P_LKRG_INFO,"Hash from 'module kobj(s)' => [0x%llx]\n",p_db.p_module_kobj_hash);
-
-      /* We should be fine now! */
+      /* now is SMPbooted! */
+      p_cpu_rehash("online");
    }
 
    /* God mode off ;) */
 //   spin_unlock_irqrestore(&p_db_lock,p_db_flags);
    spin_unlock(&p_db_lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-   /* unlock KOBJ activities */
-   mutex_unlock(P_SYM(p_kernfs_mutex));
-#endif
-   /* Release the 'module_mutex' */
-   mutex_unlock(&module_mutex);
    p_text_section_unlock();
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-//   p_print_log(P_LKRG_CRIT,
-          "Leaving function <p_cpu_online_action>\n");
-
-   return 0x0;
+   return 0;
 }
 
 int p_cpu_dead_action(unsigned int p_cpu) {
 
    int tmp_online_CPUs = p_db.p_cpu.online_CPUs;
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-//   p_print_log(P_LKRG_CRIT,
-          "Entering function <p_cpu_dead_action>\n");
-
    p_text_section_lock();
-   /* We are heavily consuming module list here - take 'module_mutex' */
-   mutex_lock(&module_mutex);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-   /* Hacky way of 'stopping' KOBJs activities */
-   mutex_lock(P_SYM(p_kernfs_mutex));
-#endif
-
    spin_lock(&p_db_lock);
 
    p_db.p_CPU_metadata_array[p_cpu].p_cpu_online = P_CPU_OFFLINE;
@@ -289,60 +222,16 @@ int p_cpu_dead_action(unsigned int p_cpu) {
     * the same scenario in this situation...
     */
    if (tmp_online_CPUs > 1 && p_db.p_cpu.online_CPUs == 1) {
-      /* First recalculate _STEXT and other critical kernel's data - now is not SMPbooted! */
-      if (hash_from_ex_table() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU OFFLINE ERROR: CANNOT GET HASH FROM EXCEPTION TABLE!\n");
-      }
-      if (hash_from_kernel_stext() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU OFFLINE ERROR: CANNOT GET HASH FROM _STEXT!\n");
-      }
-      if (hash_from_kernel_rodata() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU OFFLINE ERROR: CANNOT GET HASH FROM _RODATA!\n");
-      }
-      if (hash_from_iommu_table() != P_LKRG_SUCCESS) {
-         p_print_log(P_LKRG_CRIT,
-            "CPU OFFLINE ERROR: CANNOT GET HASH FROM IOMMU TABLE!\n");
-      }
-      /* Now recalculate modules, again some macros are different now ! */
-
-      /* OK, now recalculate hashes again! */
-      while(p_kmod_hash(&p_db.p_module_list_nr,&p_db.p_module_list_array,
-                        &p_db.p_module_kobj_nr,&p_db.p_module_kobj_array, 0x2) != P_LKRG_SUCCESS)
-         schedule();
-
-      /* Update global module list/kobj hash */
-      p_db.p_module_list_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_list_array,
-                                             (unsigned int)p_db.p_module_list_nr * sizeof(p_module_list_mem));
-
-      p_db.p_module_kobj_hash = p_lkrg_fast_hash((unsigned char *)p_db.p_module_kobj_array,
-                                             (unsigned int)p_db.p_module_kobj_nr * sizeof(p_module_kobj_mem));
-
-      p_print_log(P_LKRG_INFO,"Hash from 'module list' => [0x%llx]\n",p_db.p_module_list_hash);
-      p_print_log(P_LKRG_INFO,"Hash from 'module kobj(s)' => [0x%llx]\n",p_db.p_module_kobj_hash);
-
-      /* We should be fine now! */
+      /* now is not SMPbooted! */
+      p_cpu_rehash("offline");
    }
 
    /* God mode off ;) */
 //   spin_unlock_irqrestore(&p_db_lock,p_db_flags);
    spin_unlock(&p_db_lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
-   /* unlock KOBJ activities */
-   mutex_unlock(P_SYM(p_kernfs_mutex));
-#endif
-   /* Release the 'module_mutex' */
-   mutex_unlock(&module_mutex);
    p_text_section_unlock();
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-//   p_print_log(P_LKRG_CRIT,
-          "Leaving function <p_cpu_dead_action>\n");
-
-   return 0x0;
+   return 0;
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)

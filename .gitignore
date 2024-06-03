@@ -4,6 +4,7 @@ Module.symvers
 modules.order
 *.cmd
 *.ko
+*.mod
 *.mod.c
 *.o.d
 *.o.ur-safe
@@ -18,3 +19,8 @@ modules.order
 GPATH
 GRTAGS
 GTAGS
+
+# mkosi
+.mkosi-*
+mkosi.cache
+image.raw*

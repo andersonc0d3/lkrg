@@ -86,6 +86,21 @@ typedef struct p_cpu_info {
 #include "JUMP_LABEL/p_arch_jump_label_transform/p_arch_jump_label_transform.h"
 #include "JUMP_LABEL/p_arch_jump_label_transform_apply/p_arch_jump_label_transform_apply.h"
 
+#if defined(CONFIG_FUNCTION_TRACER)
+/*
+ * FTRACE
+ */
+#include "FTRACE/p_ftrace_modify_all_code/p_ftrace_modify_all_code.h"
+#include "FTRACE/p_ftrace_enable_sysctl/p_ftrace_enable_sysctl.h"
+#endif
+
+#if defined(CONFIG_HAVE_STATIC_CALL)
+/*
+ * Since kernel 5.10+ TRACEPOINTs don't use *_JUMP_LABEL engine on x86(-64)
+ */
+#include "TRACEPOINT/p_arch_static_call_transform/p_arch_static_call_transform.h"
+#endif
+
 enum p_jump_label_state {
 
    P_JUMP_LABEL_NONE,
@@ -154,7 +169,9 @@ typedef struct p_hash_database {
    char *kernel_stext_copy;               // copy of .text
 #endif
    p_hash_mem_block kernel_rodata;        // .rodata
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,19,0)
    p_hash_mem_block kernel_iommu_table;   // IOMMU table
+#endif
    p_hash_mem_block kernel_ex_table;      // Exception tale
    struct p_jump_label p_jump_label;      // *_JUMP_LABEL state during modification
 
@@ -168,27 +185,61 @@ extern struct notifier_block p_cpu_notifier;
 int hash_from_ex_table(void);
 int hash_from_kernel_stext(void);
 int hash_from_kernel_rodata(void);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,19,0)
 int hash_from_iommu_table(void);
+#endif
 
 static inline void p_text_section_lock(void) {
 
-   //jump_label_lock();
-/*
-   mutex_lock(P_SYM(p_jump_label_mutex));
-   mutex_lock(P_SYM(p_text_mutex));
-*/
+#if defined(P_LKRG_CI_ARCH_STATIC_CALL_TRANSFORM_H)
+   unsigned long p_text_flags;
+#endif
 
-   while (!mutex_trylock(P_SYM(p_jump_label_mutex)))
+#if !defined(P_LKRG_DEBUG_BUILD)
+   lockdep_off();
+#endif
+#if defined(CONFIG_DYNAMIC_FTRACE)
+   mutex_lock(P_SYM(p_ftrace_lock));
+#endif
+   /* We are heavily consuming module list here - take 'module_mutex' */
+   mutex_lock(P_SYM(p_module_mutex));
+   while (mutex_is_locked(P_SYM(p_jump_label_mutex)))
       schedule();
+#ifdef CONFIG_TRACEPOINTS
+   mutex_lock(P_SYM(p_tracepoints_mutex));
+#endif
+#if defined(P_LKRG_CI_ARCH_STATIC_CALL_TRANSFORM_H)
+   do {
+      p_lkrg_counter_lock_lock(&p_static_call_spinlock, &p_text_flags);
+      if (!p_lkrg_counter_lock_val_read(&p_static_call_spinlock))
+         break;
+      p_lkrg_counter_lock_unlock(&p_static_call_spinlock, &p_text_flags);
+      schedule();
+   } while(1);
+   p_lkrg_counter_lock_val_inc(&p_static_call_spinlock);
+   p_lkrg_counter_lock_unlock(&p_static_call_spinlock, &p_text_flags);
+#endif
    mutex_lock(P_SYM(p_text_mutex));
 }
 
 static inline void p_text_section_unlock(void) {
 
    mutex_unlock(P_SYM(p_text_mutex));
-   mutex_unlock(P_SYM(p_jump_label_mutex));
+#if defined(P_LKRG_CI_ARCH_STATIC_CALL_TRANSFORM_H)
+   p_lkrg_counter_lock_val_dec(&p_static_call_spinlock);
+#endif
+#ifdef CONFIG_TRACEPOINTS
+   mutex_unlock(P_SYM(p_tracepoints_mutex));
+#endif
+   /* Release the 'module_mutex' */
+   mutex_unlock(P_SYM(p_module_mutex));
+#if defined(CONFIG_DYNAMIC_FTRACE)
+   mutex_unlock(P_SYM(p_ftrace_lock));
+#endif
+#if !defined(P_LKRG_DEBUG_BUILD)
+   lockdep_on();
+#endif
 
-//   jump_label_unlock();
 }
 
 int p_create_database(void);

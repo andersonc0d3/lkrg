@@ -28,31 +28,39 @@
 #include "../../../../p_lkrg_main.h"
 
 
-char p_arch_jump_label_transform_kretprobe_state = 0x0;
+char p_arch_jump_label_transform_kretprobe_state = 0;
+p_lkrg_counter_lock p_jl_lock;
 
 static struct kretprobe p_arch_jump_label_transform_kretprobe = {
     .kp.symbol_name = "arch_jump_label_transform",
     .handler = p_arch_jump_label_transform_ret,
     .entry_handler = p_arch_jump_label_transform_entry,
     .data_size = sizeof(struct p_arch_jump_label_transform_data),
-    /* Probe up to 40 instances concurrently. */
-    .maxactive = 40,
 };
 
 
-int p_arch_jump_label_transform_entry(struct kretprobe_instance *p_ri, struct pt_regs *p_regs) {
+notrace int p_arch_jump_label_transform_entry(struct kretprobe_instance *p_ri, struct pt_regs *p_regs) {
 
    struct jump_entry *p_tmp = (struct jump_entry *)p_regs_get_arg1(p_regs);
    unsigned long p_addr = p_jump_entry_code(p_tmp);
    struct module *p_module = NULL;
+   unsigned long p_flags;
 
    p_debug_kprobe_log(
-          "Entering function <p_arch_jump_label_transform_entry>\n");
-   p_debug_kprobe_log(
-          "p_arch_jump_label_transform_entry: comm[%s] Pid:%d\n",current->comm,current->pid);
+          "p_arch_jump_label_transform_entry: comm[%s] Pid:%d",current->comm,current->pid);
 
-   p_print_log(P_LKRG_INFO,
-               "[JUMP_LABEL] New modification: type[%s] code[0x%llx] target[0x%llx] key[0x%lx]!\n",
+   do {
+      p_lkrg_counter_lock_lock(&p_jl_lock, &p_flags);
+      if (!p_lkrg_counter_lock_val_read(&p_jl_lock))
+         break;
+      p_lkrg_counter_lock_unlock(&p_jl_lock, &p_flags);
+      cpu_relax();
+   } while(1);
+   p_lkrg_counter_lock_val_inc(&p_jl_lock);
+   p_lkrg_counter_lock_unlock(&p_jl_lock, &p_flags);
+
+   p_print_log(P_LOG_WATCH,
+               "[JUMP_LABEL] New modification: type[%s] code[0x%lx] target[0x%lx] key[0x%lx]!",
                (p_regs_get_arg2(p_regs) == 1) ? "JUMP_LABEL_JMP" :
                                                 (p_regs_get_arg2(p_regs) == 0) ? "JUMP_LABEL_NOP" :
                                                                                  "UNKNOWN",
@@ -65,7 +73,7 @@ int p_arch_jump_label_transform_entry(struct kretprobe_instance *p_ri, struct pt
        * OK, *_JUMP_LABEL tries to modify kernel core .text section
        */
       p_db.p_jump_label.p_state = P_JUMP_LABEL_CORE_TEXT;
-   } else if ( (p_module = __module_text_address(p_addr)) != NULL) {
+   } else if ( (p_module = LKRG_P_MODULE_TEXT_ADDRESS(p_addr)) != NULL) {
       /*
        * OK, *_JUMP_LABEL tries to modify some module's .text section
        */
@@ -73,29 +81,23 @@ int p_arch_jump_label_transform_entry(struct kretprobe_instance *p_ri, struct pt
       p_db.p_jump_label.p_mod = p_module;
    } else {
       /*
-       * I should NEVER be here...
+       * FTRACE might generate dynamic trampoline which is not part of .text section.
+       * This is not abnormal situation anymore.
        */
+      p_print_log(P_LOG_WATCH,
+                  "[JUMP_LABEL] Not a .text section! [0x%lx]",p_addr);
       p_db.p_jump_label.p_state = P_JUMP_LABEL_WTF_STATE;
-      p_print_log(P_LKRG_ERR,
-                  "[JUMP_LABEL] <Entry> I should never be here!\n");
    }
 
-   p_debug_kprobe_log(
-          "Leaving function <p_arch_jump_label_transform_entry>\n");
-
    /* A dump_stack() here will give a stack backtrace */
-   return 0x0;
+   return 0;
 }
 
 
-int p_arch_jump_label_transform_ret(struct kretprobe_instance *ri, struct pt_regs *p_regs) {
+notrace int p_arch_jump_label_transform_ret(struct kretprobe_instance *ri, struct pt_regs *p_regs) {
 
    unsigned int p_tmp,p_tmp2;
-   unsigned char p_flag = 0x0;
-
-   p_debug_kprobe_log(
-          "Entering function <p_arch_jump_label_transform_ret>\n");
-
+   unsigned char p_flag = 0;
 
    switch (p_db.p_jump_label.p_state) {
 
@@ -110,25 +112,25 @@ int p_arch_jump_label_transform_ret(struct kretprobe_instance *ri, struct pt_reg
 
 #if defined(P_LKRG_JUMP_LABEL_STEXT_DEBUG)
          memcpy(p_db.kernel_stext_copy,p_db.kernel_stext.p_addr,p_db.kernel_stext.p_size);
-         p_db.kernel_stext_copy[p_db.kernel_stext.p_size] = 0x0;
+         p_db.kernel_stext_copy[p_db.kernel_stext.p_size] = 0;
 #endif
 
-         p_print_log(P_LKRG_INFO,
-                     "[JUMP_LABEL] Updating kernel core .text section hash!\n");
+         p_print_log(P_LOG_WATCH,
+                     "[JUMP_LABEL] Updating kernel core .text section hash!");
 
          break;
 
       case P_JUMP_LABEL_MODULE_TEXT:
 
-         for (p_tmp = 0x0; p_tmp < p_db.p_module_list_nr; p_tmp++) {
+         for (p_tmp = 0; p_tmp < p_db.p_module_list_nr; p_tmp++) {
             if (p_db.p_module_list_array[p_tmp].p_mod == p_db.p_jump_label.p_mod) {
                /*
                 * OK, we found this module on our internal tracking list.
                 * Update it's hash
                 */
 
-               p_print_log(P_LKRG_INFO,
-                      "[JUMP_LABEL] Updating module's core .text section hash module[%s : 0x%lx]!\n",
+               p_print_log(P_LOG_WATCH,
+                      "[JUMP_LABEL] Updating module's core .text section hash module[%s : 0x%lx]!",
                       p_db.p_module_list_array[p_tmp].p_name,
                       (unsigned long)p_db.p_module_list_array[p_tmp].p_mod);
 
@@ -145,20 +147,20 @@ int p_arch_jump_label_transform_ret(struct kretprobe_instance *ri, struct pt_reg
                /*
                 * Because we update module's .text section hash we need to update KOBJs as well.
                 */
-               for (p_tmp2 = 0x0; p_tmp2 < p_db.p_module_kobj_nr; p_tmp2++) {
+               for (p_tmp2 = 0; p_tmp2 < p_db.p_module_kobj_nr; p_tmp2++) {
                   if (p_db.p_module_kobj_array[p_tmp2].p_mod == p_db.p_jump_label.p_mod) {
                      p_db.p_module_kobj_array[p_tmp2].p_mod_core_text_hash =
                                       p_db.p_module_list_array[p_tmp].p_mod_core_text_hash;
-                     p_flag = 0x1;
+                     p_flag = 1;
                      break;
                   }
                }
 
                if (!p_flag) {
-                  p_print_log(P_LKRG_ERR,
-                              "[JUMP_LABEL] Updated module's list hash for module[%s] but can't find the same module in KOBJs list!\n",
+                  p_print_log(P_LOG_FAULT,
+                              "[JUMP_LABEL] Updated module's list hash for module[%s] but can't find the same module in KOBJs list!",
                               p_db.p_module_list_array[p_tmp].p_name);
-                  p_print_log(P_LKRG_INFO,"module[%s : 0x%lx]!\n",
+                  p_print_log(P_LOG_WATCH,"module[%s : 0x%lx]!",
                               p_db.p_module_list_array[p_tmp].p_name,
                               (unsigned long)p_db.p_module_list_array[p_tmp].p_mod);
                } else {
@@ -177,70 +179,55 @@ int p_arch_jump_label_transform_ret(struct kretprobe_instance *ri, struct pt_reg
 
       case P_JUMP_LABEL_WTF_STATE:
       default:
-         p_print_log(P_LKRG_ERR,
-                     "[JUMP_LABEL] <Exit> I should never be here!\n");
+         /*
+          * FTRACE might generate dynamic trampoline which is not part of .text section.
+          * This is not abnormal situation anymore.
+          */
          break;
    }
 
    p_db.p_jump_label.p_state = P_JUMP_LABEL_NONE;
 
-   p_debug_kprobe_log(
-          "Entering function <p_arch_jump_label_transform_ret>\n");
-   return 0x0;
+   p_lkrg_counter_lock_val_dec(&p_jl_lock);
+
+   return 0;
 }
 
 
 int p_install_arch_jump_label_transform_hook(void) {
 
-   int p_ret;
+   int p_tmp;
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_install_arch_jump_label_transform_hook>\n");
+   p_lkrg_counter_lock_init(&p_jl_lock);
 
-   if ( (p_ret = register_kretprobe(&p_arch_jump_label_transform_kretprobe)) < 0) {
-      p_print_log(P_LKRG_ERR, "[kretprobe] register_kretprobe() for <%s> failed! [err=%d]\n",
+   p_arch_jump_label_transform_kretprobe.maxactive = p_get_kprobe_maxactive();
+   if ( (p_tmp = register_kretprobe(&p_arch_jump_label_transform_kretprobe)) != 0) {
+      p_print_log(P_LOG_FATAL, "[kretprobe] register_kretprobe() for <%s> failed! [err=%d]",
                   p_arch_jump_label_transform_kretprobe.kp.symbol_name,
-                  p_ret);
-      goto p_install_arch_jump_label_transform_hook_out;
+                  p_tmp);
+      return P_LKRG_GENERAL_ERROR;
    }
-   p_print_log(P_LKRG_INFO, "Planted [kretprobe] <%s> at: 0x%lx\n",
+   p_print_log(P_LOG_WATCH, "Planted [kretprobe] <%s> at: 0x%lx",
                p_arch_jump_label_transform_kretprobe.kp.symbol_name,
                (unsigned long)p_arch_jump_label_transform_kretprobe.kp.addr);
-   p_arch_jump_label_transform_kretprobe_state = 0x1;
+   p_arch_jump_label_transform_kretprobe_state = 1;
 
-//   p_ret = 0x0; <- should be 0x0 anyway...
-
-p_install_arch_jump_label_transform_hook_out:
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_install_arch_jump_label_transform_hook> (p_ret => %d)\n",p_ret);
-
-   return p_ret;
+   return P_LKRG_SUCCESS;
 }
 
 
 void p_uninstall_arch_jump_label_transform_hook(void) {
 
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Entering function <p_uninstall_arch_jump_label_transform_hook>\n");
-
    if (!p_arch_jump_label_transform_kretprobe_state) {
-      p_print_log(P_LKRG_INFO, "[kretprobe] <%s> at 0x%lx is NOT installed\n",
+      p_print_log(P_LOG_WATCH, "[kretprobe] <%s> at 0x%lx is NOT installed",
                   p_arch_jump_label_transform_kretprobe.kp.symbol_name,
                   (unsigned long)p_arch_jump_label_transform_kretprobe.kp.addr);
    } else {
       unregister_kretprobe(&p_arch_jump_label_transform_kretprobe);
-      p_print_log(P_LKRG_INFO, "Removing [kretprobe] <%s> at 0x%lx nmissed[%d]\n",
+      p_print_log(P_LOG_WATCH, "Removing [kretprobe] <%s> at 0x%lx nmissed[%d]",
                   p_arch_jump_label_transform_kretprobe.kp.symbol_name,
                   (unsigned long)p_arch_jump_label_transform_kretprobe.kp.addr,
                   p_arch_jump_label_transform_kretprobe.nmissed);
-      p_arch_jump_label_transform_kretprobe_state = 0x0;
+      p_arch_jump_label_transform_kretprobe_state = 0;
    }
-
-// STRONG_DEBUG
-   p_debug_log(P_LKRG_STRONG_DBG,
-          "Leaving function <p_uninstall_arch_jump_label_transform_hook>\n");
 }
